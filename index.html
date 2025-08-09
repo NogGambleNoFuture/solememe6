@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>SoleMeme6 — Live Dashboard</title>
+<style>
+body { margin:0; font-family: Inter, system-ui, -apple-system, 'Segoe UI', Roboto, Arial; background:#071022; color:#e6eef6; }
+.topbar{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:linear-gradient(90deg,#071022,#0b1320);position:sticky;top:0;z-index:10}
+.brand{font-weight:700}
+.controls{display:flex;gap:8px;align-items:center}
+.container{padding:14px}
+.card{background:#0f1720;padding:12px;border-radius:8px}
+.table-wrap{overflow:auto}
+table{width:100%;border-collapse:collapse;color:#e6eef6;margin-top:8px}
+th,td{padding:8px;border-bottom:1px solid rgba(255,255,255,0.03);font-size:13px}
+th{color:#9aa4b2;text-align:left}
+.btn{background:#122233;color:#e6eef6;border:1px solid #274155;padding:6px 10px;border-radius:6px;cursor:pointer}
+.muted{color:#9aa4b2}
+.sidepanel{width:320px;display:flex;flex-direction:column;gap:10px}
+.footer{padding:10px;color:#9aa4b2;text-align:center;margin-top:12px;font-size:13px}
+.flash-green{background:rgba(0,255,150,0.06)}
+.flash-red{background:rgba(255,80,80,0.06)}
+@media (max-width:900px){.layout{flex-direction:column}.sidepanel{width:100%}table, thead, tbody, th, td, tr{display:block}thead{display:none}tr{margin-bottom:10px}td{padding:8px;position:relative;padding-left:40%}td:before{position:absolute;left:10px;top:8px;width:35%;white-space:nowrap;font-weight:700;color:#9aa4b2}td:nth-of-type(1):before{content:"#"}td:nth-of-type(2):before{content:"Name"}td:nth-of-type(3):before{content:"Sym"}td:nth-of-type(4):before{content:"Price"}td:nth-of-type(5):before{content:"1h%"}td:nth-of-type(6):before{content:"24h%"}td:nth-of-type(7):before{content:"Trade"}}
+</style>
+</head>
+<body>
+<header class="topbar"><div class="brand">⚡ SoleMeme6</div>
+  <div class="controls">
+    <label class="muted">Refresh</label>
+    <select id="refreshSelect"><option value="5000">5s</option><option value="10000" selected>10s</option><option value="30000">30s</option></select>
+    <button id="notifyBtn" class="btn">Enable Notifications</button>
+  </div>
+</header>
+
+<main class="container">
+  <section class="card"><h2>Top 30 Meme Coin Movers — Solana</h2><p class="muted">Uses a CORS proxy and fallback to ensure data always shows.</p></section>
+  <div class="layout" style="display:flex;gap:12px;margin-top:12px">
+    <section class="table-wrap card" style="flex:1">
+      <table id="moversTable" aria-live="polite">
+        <thead><tr><th>#</th><th>Name</th><th>Symbol</th><th>Price</th><th>1h%</th><th>24h%</th><th>Trade</th></tr></thead>
+        <tbody id="tokenTable"><tr><td colspan="7">Loading…</td></tr></tbody>
+      </table>
+    </section>
+    <aside class="sidepanel card">
+      <h3>Twitter Feed</h3>
+      <div id="tokenFeedPlaceholder" class="muted">Click a token to load its Twitter feed.</div>
+      <hr/>
+      <h4>Quick Strategy</h4>
+      <div class="muted">1h change 20–50% • 24h <100% • Liquidity &gt; $100k</div>
+    </aside>
+  </div>
+
+  <!-- chart modal -->
+  <div id="chartModal" class="card" style="display:none;position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:40;padding:10px;max-width:90%;width:900px">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h3 id="modalTitle"></h3><button id="closeModal" class="btn">Close</button>
+    </div>
+    <canvas id="priceChart" width="800" height="350"></canvas>
+    <p id="modalNote" class="muted"></p>
+  </div>
+
+</main>
+<footer class="footer">Built for NogGambleNoFuture — SoleMeme6</footer>
+
+<audio id="alertSound" src="assets/alert.mp3" preload="auto"></audio>
+
+<script>
+// Configuration
+const DEX_URL = 'https://api.dexscreener.com/latest/dex/pairs/solana';
+// CORS proxy wrapper (AllOrigins raw). If this fails, fallback to demo JSON embedded.
+const PROXY_PREFIX = 'https://api.allorigins.win/raw?url=';
+const USE_PROXY = true;
+const TOP_N = 30;
+let REFRESH_MS = 10000;
+
+// Demo fallback data (small sample)
+const DEMO = {"pairs":[{"pairAddress":"demo1","baseToken":{"name":"Demo Token A","symbol":"DTA"},"priceUsd":0.000123,"priceChange":{"h1":12.34,"h24":45.6},"liquidityUsd":200000},{"pairAddress":"demo2","baseToken":{"name":"Demo Token B","symbol":"DTB"},"priceUsd":0.01234,"priceChange":{"h1":-4.12,"h24":-2.3},"liquidityUsd":50000}] };
+
+// Helpers
+const $ = id => document.getElementById(id);
+function escapeHtml(s){ return (s||'').toString().replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function fmt(n){ if(n===undefined||n===null) return '-'; if(n>1e6) return (n/1e6).toFixed(1)+'M'; if(n>1e3) return (n/1e3).toFixed(1)+'k'; return Number(n).toLocaleString(); }
+
+// State
+let prevPrices = {};
+let priceHistory = {};
+let refreshTimer = null;
+let _chart = null;
+
+// Fetch via proxy with fallback
+async function fetchDex(){
+  try{
+    const url = (USE_PROXY ? PROXY_PREFIX + encodeURIComponent(DEX_URL) : DEX_URL);
+    const res = await fetch(url);
+    if(!res.ok) throw new Error('Fetch failed '+res.status);
+    const j = await res.json();
+    if(!j.pairs || !j.pairs.length) throw new Error('No pairs');
+    return j.pairs;
+  }catch(e){
+    console.warn('Primary fetch failed, using DEMO fallback', e);
+    return DEMO.pairs;
+  }
+}
+
+function makeRow(item, idx){
+  const id = item.pairAddress || item.pair || (item.baseToken && item.baseToken.address) || item.id || ('p'+idx);
+  const price = Number(item.priceUsd || item.price) || 0;
+  const ch1 = Number(item.priceChange?.h1 || item.change?.h1 || 0);
+  const ch24 = Number(item.priceChange?.h24 || item.change?.h24 || 0);
+  const name = item.baseToken?.name || item.name || '';
+  const sym = item.baseToken?.symbol || item.symbol || '';
+  const tr = document.createElement('tr');
+  tr.dataset.id = id;
+  tr.innerHTML = `<td>${idx+1}</td><td>${escapeHtml(name)}</td><td>${escapeHtml(sym)}</td><td>$${price.toFixed(6)}</td><td style="color:${ch1>=0? '#7cffb2':'#ff7b7b'}">${ch1.toFixed(2)}%</td><td style="color:${ch24>=0? '#7cffb2':'#ff7b7b'}">${ch24.toFixed(2)}%</td><td><button class="btn trade-btn" data-addr="${item.baseToken?.address||''}">Trade</button></td>`;
+
+  // price history
+  if(!priceHistory[id]) priceHistory[id]=[];
+  priceHistory[id].push(price);
+  if(priceHistory[id].length>120) priceHistory[id].shift();
+
+  // visual diff
+  const prev = prevPrices[id];
+  if(prev !== undefined){
+    if(price > prev) { tr.classList.add('flash-green'); setTimeout(()=>tr.classList.remove('flash-green'),2000); try{ $('alertSound').currentTime=0; $('alertSound').play(); }catch(e){} }
+    else if(price < prev) { tr.classList.add('flash-red'); setTimeout(()=>tr.classList.remove('flash-red'),2000); }
+  }
+  prevPrices[id] = price;
+
+  tr.addEventListener('click',(e)=>{
+    if(e.target && e.target.classList && e.target.classList.contains('trade-btn')) return;
+    openChartModal(id, item);
+    loadTokenTwitter(item);
+  });
+
+  tr.querySelector('.trade-btn').addEventListener('click',(e)=>{
+    e.stopPropagation();
+    const addr = e.target.dataset.addr;
+    if(!addr) return alert('Token address not available for trade');
+    window.open('https://jup.ag/swap/SOL-'+addr,'_blank');
+  });
+
+  return tr;
+}
+
+async function refreshOnce(){
+  const pairs = await fetchDex();
+  // sort by abs 1h change
+  pairs.sort((a,b)=> Math.abs(Number(b.priceChange?.h1||b.change?.h1||0)) - Math.abs(Number(a.priceChange?.h1||a.change?.h1||0)));
+  const top = pairs.slice(0, TOP_N);
+  const tbody = $('tokenTable');
+  tbody.innerHTML='';
+  top.forEach((p,i)=> tbody.appendChild(makeRow(p,i)));
+}
+
+// Chart modal
+function openChartModal(id, item){
+  const modal = $('chartModal');
+  const title = $('modalTitle');
+  const note = $('modalNote');
+  title.textContent = (item.baseToken?.symbol||item.symbol||'') + ' — Recent';
+  note.textContent = 'Chart built from client-side recent prices.';
+  const ctx = document.getElementById('priceChart').getContext('2d');
+  const data = priceHistory[id] && priceHistory[id].length ? priceHistory[id] : [item.priceUsd||item.price||0];
+  const labels = data.map((_,i)=>i);
+  if(_chart) _chart.destroy();
+  _chart = new Chart(ctx, { type:'line', data:{ labels, datasets:[{ label:'price', data, borderColor:'#00ffd1', backgroundColor:'rgba(0,255,209,0.06)', tension:0.25 }]}, options:{responsive:true, maintainAspectRatio:false, scales:{x:{display:false}}} });
+  modal.style.display='block';
+}
+
+document.getElementById && document.addEventListener('DOMContentLoaded', ()=>{
+  $('closeModal')?.addEventListener('click', ()=>{ $('chartModal').style.display='none'; if(_chart) _chart.destroy(); });
+  $('refreshSelect').addEventListener('change',(e)=>{ REFRESH_MS = Number(e.target.value); clearInterval(refreshTimer); refreshOnce(); refreshTimer = setInterval(refreshOnce, REFRESH_MS); });
+  $('notifyBtn').addEventListener('click', ()=>{ if(!("Notification" in window)) return alert('Notifications unsupported'); Notification.requestPermission().then(p=>{ if(p==='granted') alert('Notifications enabled'); else alert('Permission denied'); }); });
+
+  refreshOnce();
+  refreshTimer = setInterval(refreshOnce, REFRESH_MS);
+});
+
+// load Twitter widgets script dynamically so embeds work on GitHub Pages
+(function(){ var t=document.createElement('script'); t.src='https://platform.twitter.com/widgets.js'; t.async=true; document.body.appendChild(t); })();
+
+// token -> twitter mapping (small sample)
+const TOKEN_TWITTER = {"BONK":"bonk_inu","PEPE":"pepecoin","SHIB":"Shibtoken","DOGE":"dogecoin","FLOKI":"RealFlokiInu"};
+function loadTokenTwitter(item){
+  const ph = $('tokenFeedPlaceholder');
+  const sym = (item.baseToken?.symbol || item.symbol || '').toUpperCase();
+  const handle = TOKEN_TWITTER[sym];
+  if(!handle){ ph.innerHTML = '<div class="muted">No Twitter handle for this token.</div>'; return; }
+  ph.innerHTML = `<a class="twitter-timeline" data-height="400" href="https://twitter.com/${handle}">Tweets by ${handle}</a>`;
+  if(window.twttr && window.twttr.widgets) try{ window.twttr.widgets.load(); }catch(e){}
+}
+</script>
+</body>
+</html>
